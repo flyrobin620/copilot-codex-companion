@@ -9,6 +9,7 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 from catalog import ensure_defaults
+from upstream import select_upstream, settings_upstream
 
 
 ROOT = Path(__file__).resolve().parent
@@ -119,6 +120,9 @@ def main(argv=None):
         print('Local bridge restarted.', file=sys.stderr)
         return
     args = auth_args(settings['auth_args'], options.hostname)
+    current_upstream = settings_upstream(settings)
+    if select_upstream(args, current_upstream) != current_upstream:
+        raise RuntimeError('This hostname requires a different Copilot API. Use update.cmd --hostname HOST to switch credentials and endpoint together.')
     start_bridge(ROOT, settings)
     result = subprocess.run([settings['auth_command'], *args],
                             capture_output=True, timeout=settings['auth_timeout_ms']/1000)

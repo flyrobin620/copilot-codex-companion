@@ -1,4 +1,4 @@
-# Copilot Codex Companion 1.1.4
+# Copilot Codex Companion 1.1.5
 
 Windows 本机兼容方案。包含消息 ID 修复和 Codex 模型目录适配。非 OpenAI/GitHub 官方补丁。采用 [MIT 许可证](LICENSE)。
 
@@ -16,10 +16,10 @@ cd copilot-codex-companion
 .\install.cmd --automatic-context
 
 # 已安装 1.1.0 / 1.1.1：原地更新，也可同时切换 hostname
-.\update.cmd --hostname git.example.com
+.\update.cmd --hostname your-enterprise.ghe.com
 
 # 自定义旧版安装目录
-.\update.cmd --dest "D:\Tools\CodexCopilotCompat" --hostname git.example.com
+.\update.cmd --dest "D:\Tools\CodexCopilotCompat" --hostname your-enterprise.ghe.com
 ```
 
 以后在源码目录运行 `git pull --ff-only`，再运行 `update.cmd`；使用 ZIP 时下载新版并解压到独立目录后运行 `update.cmd`。省略 `--hostname` 会保留当前主机。请先等活动任务结束并退出 Codex，更新成功后重新打开。
@@ -45,6 +45,22 @@ cd copilot-codex-companion
 
 Copilot CLI、GitHub CLI（gh）和 Codex CLI 是不同工具。安装器复用目标电脑 config.toml 中原有的认证命令；原命令若是 gh，需要目标机已有 gh 登录。仅安装 Copilot CLI 不等于 gh 或 codex.exe 已可用。
 
+### GitHub Enterprise Cloud 的认证主机与 API 地址
+
+从 1.1.5 起，安装和更新会让认证主机与 Copilot API 地址保持对应：
+
+| 认证 hostname | Copilot API |
+| --- | --- |
+| `github.com` | `https://api.enterprise.githubcopilot.com` |
+| `microsoft.ghe.com` | `https://copilot-api.microsoft.ghe.com` |
+| `<enterprise>.ghe.com` | `https://copilot-api.<enterprise>.ghe.com` |
+
+可以从 `--hostname` 或原认证命令的 hostname 参数识别 GHE 主机；未指定主机时保留已配置的受支持 API 地址。脚本会打印最终地址，保存在安装状态中，模型目录、Responses 和 compact 请求使用同一地址。已有安装通过 `update.cmd --hostname HOST` 同时切换认证与地址；旧版没有保存地址的安装也会在更新时迁移。
+
+**1.1.4 及更早版本只切换认证 hostname，代理仍使用公共 Enterprise API，可能导致 GHE OAuth token 被错误端点拒绝并返回 401。** GitHub 上登录成功不代表 token 可用于另一主机的 Copilot 服务。1.1.5 的验证错误会标明模型目录请求、HTTP 状态和配置的 API 地址，不输出 token；若地址正确仍返回 401/403，再检查该 GHE 登录及 Copilot 授权。
+
+地址规则依据 GitHub 官方的 [GHE 数据驻留说明](https://github.com/github/gh-aw/blob/main/docs/src/content/docs/troubleshooting/debug-ghe.md) 和 [Copilot 网络允许列表](https://docs.github.com/en/copilot/reference/copilot-allowlist-reference)。
+
 ## 更新已安装的 1.1.0 / 切换 hostname
 
 将完整的新版本包传到目标 Windows 电脑，解压到独立目录。等活动任务结束并退出 Codex，然后在**新包目录**运行：
@@ -54,23 +70,23 @@ Copilot CLI、GitHub CLI（gh）和 Codex CLI 是不同工具。安装器复用�
 .\update.cmd
 
 # 更新并持久切换认证主机
-.\update.cmd --hostname git.example.com
+.\update.cmd --hostname your-enterprise.ghe.com
 
 # 自定义安装目录：--dest 指向旧版安装目录，不是新包目录
-.\update.cmd --dest "D:\Tools\CodexCopilotCompat" --hostname git.example.com
+.\update.cmd --dest "D:\Tools\CodexCopilotCompat" --hostname your-enterprise.ghe.com
 ```
 
 无需先卸载，也不要先将新文件手工覆盖旧安装。脚本先验证认证命令，再将旧程序、settings.json 和模型目录快照备份到安装目录的 `update-backup-*`，停止自己的 bridge，替换程序，重启并验证认证和模型目录。验证失败时尝试自动恢复旧文件、旧 hostname 并重新启动；恢复失败会显示备份路径。备份包含本机安装信息，请仅保留在本机。
 
-更新保留 config.toml、端口、安装身份、原认证命令、上下文设置和卸载恢复信息。省略 `--hostname` 时保留当前主机，不默认指定域名。目标主机需先完成原认证工具的登录（如 `gh auth login --hostname git.example.com`）。更新成功后重新打开 Codex，以刷新缓存的凭据。
+更新保留 config.toml、端口、安装身份、原认证命令、上下文设置和卸载恢复信息。省略 `--hostname` 时保留当前主机，不默认指定域名。目标主机需先完成原认证工具的登录（如 `gh auth login --hostname your-enterprise.ghe.com`）。更新成功后重新打开 Codex，以刷新缓存的凭据。
 
 以后仅切换 hostname，可在**安装目录**运行同一个命令：
 
 ```powershell
-.\update.cmd --hostname another.example.com
+.\update.cmd --hostname another.ghe.com
 ```
 
-`update.cmd` 需要同目录的完整程序文件，不能只复制这一个脚本。命令行自动化可使用 `python manage.py update --dest "D:\Tools\CodexCopilotCompat" --hostname git.example.com`，避免 `.cmd` 结束时的按键暂停。
+`update.cmd` 需要同目录的完整程序文件，不能只复制这一个脚本。命令行自动化可使用 `python manage.py update --dest "D:\Tools\CodexCopilotCompat" --hostname your-enterprise.ghe.com`，避免 `.cmd` 结束时的按键暂停。
 
 ### 卸载残留目录与默认路径
 
@@ -102,7 +118,7 @@ git pull --ff-only
 # --force 是 --force-config 的别名
 ```
 
-`--force-config` 仅用于 `install`，会覆盖当前自定义 provider 的 `base_url`、`wire_api`、认证 `command` 和 `args`，重建为 Copilot Enterprise Responses 上游和 `gh auth token --hostname HOST`。省略 hostname 时使用 `gh auth token` 自身的默认选择，不写死域名。模型、请求头和其他配置保留。
+`--force-config` 仅用于 `install`，会覆盖当前自定义 provider 的 `base_url`、`wire_api`、认证 `command` 和 `args`，重建为与 hostname 对应的 Copilot Enterprise Responses 上游和 `gh auth token --hostname HOST`。GHE 用户应显式指定其 `*.ghe.com` 主机；省略 hostname 时使用 `gh auth token` 自身的默认选择和公共 Enterprise API。模型、请求头和其他配置保留。
 
 脚本先验证 gh 认证，再将原始配置逐字节备份到 config.toml 同目录的 `config.toml.before-force-*.bak`（自定义配置文件使用其自己的文件名）。新 bridge 和模型目录验证通过后才写入活动配置。安装目录中的 `config.before.toml` 保存重建后的直连配置，供将来卸载恢复。失败安装留下有效 `settings.failed.json` 时，可以原命令重试，不必再删除目录。
 
@@ -161,7 +177,7 @@ git pull --ff-only
 .\install.cmd --config "D:\path\config.toml" --dest "D:\Tools\CodexCopilotCompat" --automatic-context
 
 # 指定原认证命令使用的 hostname（例如 gh auth token 的主机）
-.\install.cmd --hostname git.example.com --automatic-context
+.\install.cmd --hostname your-enterprise.ghe.com --automatic-context
 
 # 重启已安装的 bridge；也支持 --dest 指定安装目录
 .\restart.cmd
@@ -174,7 +190,7 @@ git pull --ff-only
 
 `--hostname HOST` 是可选参数，不提供时完整保留原认证命令参数，不默认填入任何固定域名。提供时覆盖已有的 `--hostname HOST` 或 `--hostname=HOST`，没有则添加；原认证命令需要支持该参数。安装和更新时保存此选择，卸载仍恢复最初安装前的原配置。已有安装请使用 `update.cmd`。
 
-也可直接调用安装目录中的 `auth_bridge.py`：`python auth_bridge.py --hostname git.example.com` 仅覆盖这次认证调用的主机，标准输出仍然只包含认证凭据。`python auth_bridge.py --restart` 只重启 bridge，不请求或输出凭据；两个参数不能同时使用。主机参数选择认证来源，不改变 Copilot API 地址。
+也可直接调用安装目录中的 `auth_bridge.py`：`python auth_bridge.py --hostname your-enterprise.ghe.com` 仅覆盖这次认证调用的主机，标准输出仍然只包含认证凭据。如果该主机需要不同的 Copilot API，辅助程序会拒绝本次调用并提示使用 `update.cmd --hostname HOST`，避免把一种主机的 token 发到另一端点。`python auth_bridge.py --restart` 只重启 bridge，不请求或输出凭据；两个参数不能同时使用。
 
 重启会校验安装身份，使用本机管理密钥关闭服务，等待端口释放后重新启动并检查健康状态；服务原本未运行时直接启动。请等活动请求结束后再重启，以免中断正在生成的回复。无法确认服务身份或停止状态时会报错，不终止其他进程。
 
@@ -186,7 +202,7 @@ git pull --ff-only
 
 ## 验证
 
-本次更新使用 `python -m unittest -v test_distribution` 验证 37 项测试，覆盖 ID 归一化、模型能力转换、安装/卸载、卸载残留目录重装与失败恢复、失效的本机连接恢复、强制重建配置及完整备份、连接诊断脱敏、默认路径提示、上下文恢复、hostname 保留与覆盖、服务重启、身份校验、停止超时、旧版原地更新、更新失败回退、更新前检查及中文和空格路径。认证使用合成测试凭据，模型目录检查使用测试替身。
+本次更新使用 `python -m unittest -v test_distribution` 验证 44 项测试，覆盖 ID 归一化、模型能力转换、安装/卸载、卸载残留目录重装与失败恢复、失效的本机连接恢复、强制重建配置及完整备份、连接诊断脱敏、GHE API 路由与主机切换、401/403 诊断、默认路径提示、上下文恢复、hostname 保留与覆盖、服务重启、身份校验、停止超时、旧版原地更新、更新失败回退、更新前检查及中文和空格路径。认证使用合成测试凭据，模型目录检查使用测试替身；GHE 端点依据官方文档和本地路由测试验证，未使用真实企业 token 发起远端测试。
 
 `npm test` 另验证 Node 命令入口的 Python 探测、参数转发、退出码和异常处理；npm 包可通过本地 `.tgz` 执行测试，无需发布到 registry。
 
@@ -208,10 +224,10 @@ npx --yes copilot-codex-companion@latest install --automatic-context
 npx --yes copilot-codex-companion@latest update
 
 # 更新并持久切换 hostname
-npx --yes copilot-codex-companion@latest update --hostname git.example.com
+npx --yes copilot-codex-companion@latest update --hostname your-enterprise.ghe.com
 
 # 自定义安装目录
-npx --yes copilot-codex-companion@latest update --dest "D:\Tools\CodexCopilotCompat" --hostname git.example.com
+npx --yes copilot-codex-companion@latest update --dest "D:\Tools\CodexCopilotCompat" --hostname your-enterprise.ghe.com
 
 # 重启、自检和卸载
 npx --yes copilot-codex-companion@latest restart
@@ -219,12 +235,12 @@ npx --yes copilot-codex-companion@latest check
 npx --yes copilot-codex-companion@latest uninstall
 ```
 
-`@latest` 请求 registry 当前的 latest 版本；可换成 `@1.1.4` 固定版本。每次 `update` 都会执行原有的备份、校验和失败回退流程。安装后的服务使用 `%LOCALAPPDATA%\CodexCopilotCompat`（或 `--dest`），不依赖 npm 缓存路径；npx 退出后服务继续运行。等待活动任务结束并退出 Codex 后再更新，成功后重新打开 Codex 刷新凭据。
+`@latest` 请求 registry 当前的 latest 版本；可换成 `@1.1.5` 固定版本。每次 `update` 都会执行原有的备份、校验和失败回退流程。安装后的服务使用 `%LOCALAPPDATA%\CodexCopilotCompat`（或 `--dest`），不依赖 npm 缓存路径；npx 退出后服务继续运行。等待活动任务结束并退出 Codex 后再更新，成功后重新打开 Codex 刷新凭据。
 
 尚未发布时，可将 `npm pack` 生成的 `.tgz` 传到另一台电脑，直接通过 npx 使用：
 
 ```powershell
-npx --yes --package .\copilot-codex-companion-1.1.4.tgz copilot-codex-companion update --hostname git.example.com
+npx --yes --package .\copilot-codex-companion-1.1.5.tgz copilot-codex-companion update --hostname your-enterprise.ghe.com
 ```
 
 维护者发布步骤：

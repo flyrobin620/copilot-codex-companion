@@ -20,10 +20,11 @@ import urllib.request
 from pathlib import Path
 from catalog import ensure_defaults
 from auth_bridge import auth_args, restart_bridge, start_bridge, stop_bridge
+from upstream import DEFAULT_UPSTREAM, select_upstream, settings_upstream, validate_upstream
 
-VERSION = '1.1.4'
-UPSTREAM = 'https://api.enterprise.githubcopilot.com'
-FILES = ('proxy.py', 'catalog.py', 'auth_bridge.py', 'manage.py', 'install.cmd', 'check.cmd', 'restart.cmd', 'update.cmd', 'uninstall.cmd', 'README.md')
+VERSION = '1.1.5'
+UPSTREAM = DEFAULT_UPSTREAM
+FILES = ('proxy.py', 'catalog.py', 'auth_bridge.py', 'upstream.py', 'manage.py', 'install.cmd', 'check.cmd', 'restart.cmd', 'update.cmd', 'uninstall.cmd', 'README.md')
 CONTEXT_KEYS = ('model_context_window','model_auto_compact_token_limit')
 
 
@@ -138,7 +139,15 @@ def catalog_check(state,cfg,token):
     headers.update({key:os.environ[env] for key,env in p.get('env_http_headers',{}).items() if env in os.environ})
     headers['Authorization']='Bearer '+token.decode().strip()
     saved=ensure_defaults(Path(state['runtime']),state.get('codex_command','codex'))
-    catalog=local_json(state['changed']['base_url']+'/models?client_version='+saved['client_version'],headers=headers,timeout=40)
+    endpoint = settings_upstream(state) + '/models'
+    print('Checking Copilot model catalog: ' + endpoint)
+    try:
+        catalog=local_json(state['changed']['base_url']+'/models?client_version='+saved['client_version'],headers=headers,timeout=40)
+    except urllib.error.HTTPError as exc:
+        status = exc.code
+        exc.close()
+        detail = ' Verify the GitHub hostname, login and Copilot access for this enterprise.' if status in (401, 403) else ''
+        raise RuntimeError(f'Copilot model catalog validation failed: HTTP {status} at {endpoint}.{detail} No token was printed.') from None
     selected=next((m for m in catalog['models'] if m['slug']==cfg['model']),None)
     if not selected:
         raise RuntimeError('The selected model is not enabled or lacks matching Codex defaults; limits were not changed.')
@@ -176,9 +185,12 @@ def recover_uninstalled_connection(original, cfg, state):
     if not changed.get('base_url') or p.get('base_url') != changed['base_url']:
         return original
     old = state.get('old', {})
+    try:
+        validate_upstream(old.get('base_url', ''))
+    except RuntimeError:
+        raise RuntimeError('The uninstall record does not contain a supported original Copilot API URL.') from None
     if (provider != state.get('provider')
             or changed['base_url'] != f"http://127.0.0.1:{state.get('port')}"
-            or old.get('base_url', '').rstrip('/') != UPSTREAM
             or not old.get('command')
             or any(key not in changed or key not in old for key in ('base_url', 'command', 'args', 'timeout_ms'))):
         raise RuntimeError('The configuration points to an old bridge, but its uninstall record cannot safely restore the original connection.')
@@ -219,7 +231,7 @@ def force_copilot_connection(original, cfg, hostname):
     target = expected['model_providers'][provider]
     restored = original
     section = 'model_providers.' + provider
-    for key, value in {'base_url': UPSTREAM, 'wire_api': 'responses'}.items():
+    for key, value in {'base_url': select_upstream([], hostname=hostname), 'wire_api': 'responses'}.items():
         restored = field(restored, section, key, value)
         target[key] = value
     if 'auth' not in p:
@@ -277,10 +289,12 @@ def install(config, dest, port, automatic_context=False, codex_command='codex', 
     details = connection_details(config, provider, p)
     if p.get('wire_api', 'responses') != 'responses':
         raise RuntimeError('This adapter requires wire_api = "responses". ' + details)
-    if p.get('base_url', '').rstrip('/') != UPSTREAM:
+    try:
+        configured_upstream = validate_upstream(p.get('base_url', ''))
+    except RuntimeError:
         raise RuntimeError('The selected provider does not use the supported Copilot API URL. ' + details
-                           + f' Expected base_url: {UPSTREAM}. --hostname selects the credential host, not the API URL.'
-                           + ' If installation records were deleted, install --force-config explicitly rebuilds this provider using gh auth token.')
+                           + ' Use the public Enterprise endpoint or https://copilot-api.<enterprise>.ghe.com.'
+                           + ' If installation records were deleted, install --force-config explicitly rebuilds this provider using gh auth token.') from None
     if p.get('supports_websockets'):
         raise RuntimeError('This adapter supports HTTP/SSE only. WebSocket configuration was left unchanged.')
     a = p.get('auth', {})
@@ -293,6 +307,8 @@ def install(config, dest, port, automatic_context=False, codex_command='codex', 
     if not isinstance(args, list) or not all(isinstance(v, str) for v in args):
         raise RuntimeError('Invalid credential-helper argument list.')
     args = auth_args(args, hostname)
+    upstream_url = select_upstream(args, configured_upstream)
+    print('Copilot API: ' + upstream_url)
     pythonw = Path(sys.executable).with_name('pythonw.exe')
     if not pythonw.is_file():
         raise RuntimeError('pythonw.exe is required; use a standard Windows Python installation.')
@@ -336,7 +352,7 @@ def install(config, dest, port, automatic_context=False, codex_command='codex', 
         state = {'version': VERSION, 'installation': secrets.token_hex(16), 'control': secrets.token_hex(32),
                  'config': str(config), 'runtime':str(dest), 'codex_command':codex_command,
                  'removed_context_overrides':removed_context, 'provider': provider, 'port': port, 'auth_command': command,
-                 'auth_args': args, 'auth_timeout_ms': timeout, 'changed': changed,
+                 'auth_args': args, 'auth_timeout_ms': timeout, 'upstream_url': upstream_url, 'changed': changed,
                  'old': {'base_url':p['base_url'], 'command':a['command'], 'args':a.get('args'), 'timeout_ms':a.get('timeout_ms')},
                  'old_present': {k: k in a for k in ('args', 'timeout_ms')}}
         (dest/'config.before.toml').write_text(connection_original, encoding='utf-8')
@@ -408,8 +424,8 @@ def update(dest, hostname=None, source=None, config=None, port=None, automatic_c
 
 def _update(dest, hostname, source):
     state = settings_at(dest)
-    if state.get('version') not in ('1.1.0', '1.1.1', '1.1.2', '1.1.3', VERSION):
-        raise RuntimeError('Only existing 1.1.0 through 1.1.4 installations are supported.')
+    if state.get('version') not in ('1.1.0', '1.1.1', '1.1.2', '1.1.3', '1.1.4', VERSION):
+        raise RuntimeError('Only existing 1.1.0 through 1.1.5 installations are supported.')
     if Path(state['runtime']).resolve() != dest:
         raise RuntimeError('Installation path mismatch. Use the original installation directory.')
     cfg = tomllib.loads(Path(state['config']).read_text(encoding='utf-8-sig'))
@@ -424,6 +440,8 @@ def _update(dest, hostname, source):
     updated = copy.deepcopy(state)
     updated['version'] = VERSION
     updated['auth_args'] = auth_args(state['auth_args'], hostname)
+    updated['upstream_url'] = select_upstream(updated['auth_args'], settings_upstream(state))
+    print('Copilot API: ' + updated['upstream_url'])
     credential(updated['auth_command'], updated['auth_args'], updated['auth_timeout_ms'])
     if not Path(sys.executable).with_name('pythonw.exe').is_file():
         raise RuntimeError('pythonw.exe is required; no installation files were changed.')

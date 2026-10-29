@@ -9,9 +9,9 @@ import urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from catalog import adapt, ensure_defaults
+from upstream import settings_upstream
 
 PORT = 43129
-UPSTREAM = 'https://api.enterprise.githubcopilot.com'
 VERSION = 'copilot-item-id-compat-v1'
 SETTINGS = {}
 
@@ -64,7 +64,8 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         if self.path == '/health':
-            return self.reply(200, {'adapter': VERSION, 'installation': SETTINGS.get('installation'), 'catalog_adapter': '1.1.0'})
+            return self.reply(200, {'adapter': VERSION, 'installation': SETTINGS.get('installation'), 'catalog_adapter': '1.1.0',
+                                    'upstream_url': settings_upstream(SETTINGS)})
         if self.path.split('?')[0] != '/models':
             return self.reply(404, {'error': 'Unsupported path'})
         self.serve_catalog()
@@ -80,13 +81,14 @@ class Handler(BaseHTTPRequestHandler):
                                         'requested':requested,'available':saved['client_version']})
             headers={k:v for k,v in self.headers.items() if k.lower() not in ('host','connection','content-length','accept-encoding')}
             headers['Accept-Encoding']='identity'
-            request=urllib.request.Request(UPSTREAM+'/models',headers=headers)
+            request=urllib.request.Request(settings_upstream(SETTINGS)+'/models',headers=headers)
             with urllib.request.urlopen(request,timeout=30) as upstream:
                 data=json.load(upstream)
             result=adapt(data,saved['catalog'])
             return self.reply(200,result)
         except urllib.error.HTTPError as exc:
-            return self.reply(exc.code, {'error':'Copilot model catalog request failed','status':exc.code})
+            return self.reply(exc.code, {'error':'Copilot model catalog request failed','status':exc.code,
+                                         'upstream_url':settings_upstream(SETTINGS)})
         except Exception as exc:
             message=str(exc) if isinstance(exc,RuntimeError) else type(exc).__name__
             return self.reply(502,{'error':'Catalog adaptation failed','detail':message})
@@ -117,7 +119,7 @@ class Handler(BaseHTTPRequestHandler):
         excluded = {'host', 'connection', 'content-length', 'accept-encoding', 'transfer-encoding', 'proxy-authorization', 'proxy-connection'}
         headers = {k:v for k,v in self.headers.items() if k.lower() not in excluded}
         headers['Accept-Encoding'] = 'identity'
-        req = urllib.request.Request(UPSTREAM + self.path, data=body, headers=headers, method=self.command)
+        req = urllib.request.Request(settings_upstream(SETTINGS) + self.path, data=body, headers=headers, method=self.command)
         try:
             response = urllib.request.urlopen(req, timeout=600)
         except urllib.error.HTTPError as e:
@@ -168,5 +170,6 @@ class Handler(BaseHTTPRequestHandler):
 if __name__ == '__main__':
     SETTINGS = json.loads(Path(__file__).with_name('settings.json').read_text(encoding='utf-8'))
     PORT = SETTINGS['port']
+    settings_upstream(SETTINGS)
     with LocalServer(('127.0.0.1', PORT), Handler) as server:
         server.serve_forever()

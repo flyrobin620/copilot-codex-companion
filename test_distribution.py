@@ -12,11 +12,27 @@ from pathlib import Path
 from unittest import mock
 import manage
 import auth_bridge
+import proxy
 from proxy import Normalizer
 from catalog import adapt
+from upstream import DEFAULT_UPSTREAM, select_upstream, settings_upstream, validate_upstream
 
 
 class AuthBridgeTests(unittest.TestCase):
+    def test_direct_hostname_change_cannot_mix_tokens_and_api_hosts(self):
+        root = mock.MagicMock()
+        (root/'settings.json').read_text.return_value = json.dumps({
+            'auth_args': ['auth', 'token', '--hostname', 'github.com'],
+            'upstream_url': DEFAULT_UPSTREAM,
+        })
+        with mock.patch.object(auth_bridge, 'ROOT', root), \
+             mock.patch.object(auth_bridge, 'start_bridge') as start, \
+             mock.patch.object(auth_bridge.subprocess, 'run') as credential:
+            with self.assertRaisesRegex(RuntimeError, 'different Copilot API'):
+                auth_bridge.main(['--hostname', 'microsoft.ghe.com'])
+            start.assert_not_called()
+            credential.assert_not_called()
+
     def test_hostname_optional_and_replaces_existing_flags(self):
         original = ['auth', 'token', '--hostname', 'old.example.test']
         self.assertEqual(auth_bridge.auth_args(original), original)
@@ -83,6 +99,78 @@ class ConnectionDiagnosticsTests(unittest.TestCase):
     def test_connection_details_handle_missing_and_invalid_urls(self):
         for value, expected in ((None, '<missing>'), ('not a url', '<invalid URL>'), ('https://host:bad', '<invalid URL>')):
             self.assertIn(expected, manage.connection_details(Path('config.toml'), 'enterprise', {'base_url': value}))
+
+
+class UpstreamTests(unittest.TestCase):
+    def test_ghe_hostname_selects_enterprise_endpoint(self):
+        for args in (['auth', 'token', '--hostname', 'microsoft.ghe.com'],
+                     ['auth', 'token', '--hostname=Microsoft.GHE.COM']):
+            self.assertEqual(select_upstream(args), 'https://copilot-api.microsoft.ghe.com')
+        self.assertEqual(select_upstream([], hostname='another.ghe.com'), 'https://copilot-api.another.ghe.com')
+        self.assertEqual(select_upstream([], 'https://copilot-api.microsoft.ghe.com', 'github.com'), DEFAULT_UPSTREAM)
+        self.assertEqual(select_upstream([]), DEFAULT_UPSTREAM)
+        self.assertEqual(select_upstream(['auth', '--', '--hostname=microsoft.ghe.com']), DEFAULT_UPSTREAM)
+
+    def test_migration_uses_saved_host_and_respects_explicit_endpoint(self):
+        legacy = {'old': {'base_url': DEFAULT_UPSTREAM}, 'auth_args': ['auth', 'token', '--hostname', 'microsoft.ghe.com']}
+        self.assertEqual(settings_upstream(legacy), 'https://copilot-api.microsoft.ghe.com')
+        self.assertEqual(settings_upstream({'old': {'base_url': DEFAULT_UPSTREAM}}), DEFAULT_UPSTREAM)
+        self.assertEqual(settings_upstream({'upstream_url': 'https://copilot-api.another.ghe.com'}), 'https://copilot-api.another.ghe.com')
+
+    def test_rejects_non_copilot_origins_and_embedded_credentials(self):
+        for value in ('http://copilot-api.microsoft.ghe.com', 'https://copilot-api.microsoft.ghe.com.evil.test',
+                      'https://user:secret@copilot-api.microsoft.ghe.com', 'https://copilot-api.microsoft.ghe.com/?token=secret',
+                      'https://copilot-api.microsoft.ghe.com:8443', 'https://example.test', 'https://copilot-api.microsoft.ghe.com/path'):
+            with self.assertRaises(RuntimeError):
+                validate_upstream(value)
+        self.assertEqual(validate_upstream('https://copilot-api.microsoft.ghe.com/'), 'https://copilot-api.microsoft.ghe.com')
+
+    def test_proxy_routes_models_and_responses_to_same_saved_endpoint(self):
+        endpoint = 'https://copilot-api.microsoft.ghe.com'
+        handler = object.__new__(proxy.Handler)
+        handler.headers = {'Authorization': 'Bearer SYNTHETIC_TEST_CREDENTIAL'}
+        handler.path = '/models'
+        handler.reply = mock.Mock()
+        with mock.patch.object(proxy, 'SETTINGS', {'upstream_url': endpoint}), \
+             mock.patch.object(proxy, 'ensure_defaults', return_value={'catalog': {}}), \
+             mock.patch.object(proxy, 'adapt', return_value={'models': []}), \
+             mock.patch.object(proxy.urllib.request, 'urlopen', return_value=io.BytesIO(b'{"data":[]}')) as request:
+            handler.serve_catalog()
+            self.assertEqual(request.call_args.args[0].full_url, endpoint+'/models')
+            handler.reply.assert_called_once_with(200, {'models': []})
+        for route in ('/responses', '/responses/compact'):
+            response = mock.MagicMock()
+            response.__enter__.return_value = response
+            response.status = 200
+            response.headers = {'Content-Type': 'application/json'}
+            response.read.side_effect = [b'{}', b'']
+            handler.path = route
+            handler.command = 'POST'
+            handler.send_response = mock.Mock()
+            handler.send_header = mock.Mock()
+            handler.end_headers = mock.Mock()
+            handler.wfile = io.BytesIO()
+            with mock.patch.object(proxy, 'SETTINGS', {'upstream_url': endpoint}), \
+                 mock.patch.object(proxy.urllib.request, 'urlopen', return_value=response) as request:
+                handler.forward(b'{}')
+                self.assertEqual(request.call_args.args[0].full_url, endpoint+route)
+                self.assertEqual(handler.wfile.getvalue(), b'{}')
+
+    def test_catalog_auth_error_names_endpoint_without_token(self):
+        endpoint = 'https://copilot-api.microsoft.ghe.com'
+        state = {'provider': 'enterprise', 'runtime': '.', 'changed': {'base_url': 'http://127.0.0.1:43129'}, 'upstream_url': endpoint}
+        cfg = {'model_providers': {'enterprise': {}}}
+        for status in (401, 403):
+            body = io.BytesIO(b'SECRET_TOKEN')
+            error = manage.urllib.error.HTTPError('http://localhost/models?token=SECRET_TOKEN', status, 'Unauthorized', {}, body)
+            output = io.StringIO()
+            with mock.patch.object(manage, 'ensure_defaults', return_value={'client_version': '0.1.0'}), \
+                 mock.patch.object(manage, 'local_json', side_effect=error), mock.patch.object(sys, 'stdout', output):
+                with self.assertRaisesRegex(RuntimeError, f'HTTP {status}') as exc:
+                    manage.catalog_check(state, cfg, b'SECRET_TOKEN')
+            self.assertIn(endpoint+'/models', str(exc.exception))
+            self.assertNotIn('SECRET_TOKEN', str(exc.exception) + output.getvalue())
+            self.assertTrue(body.closed)
 
 
 class CatalogTests(unittest.TestCase):
@@ -186,14 +274,15 @@ refresh_interval_ms = 300000
             manage.install(self.config, self.dest, self.port, hostname='microsoft.ghe.com', force_config=True)
             credential.assert_called_once_with('C:\\Synthetic gh.exe', ['auth', 'token', '--hostname', 'microsoft.ghe.com'], 5000)
             state = manage.settings_at(self.dest)
-            self.assertEqual(state['old']['base_url'], manage.UPSTREAM)
+            self.assertEqual(state['old']['base_url'], 'https://copilot-api.microsoft.ghe.com')
+            self.assertEqual(state['upstream_url'], 'https://copilot-api.microsoft.ghe.com')
             self.assertEqual(state['old']['command'], 'gh')
             self.assertEqual(state['old']['args'], ['auth', 'token', '--hostname', 'microsoft.ghe.com'])
             backups = list(self.root.glob(self.config.name+'.before-force-*.bak'))
             self.assertEqual(len(backups), 1)
             self.assertEqual(backups[0].read_bytes(), before)
             saved = tomllib.loads((self.dest/'config.before.toml').read_text(encoding='utf-8'))
-            self.assertEqual(saved['model_providers']['enterprise']['base_url'], manage.UPSTREAM)
+            self.assertEqual(saved['model_providers']['enterprise']['base_url'], 'https://copilot-api.microsoft.ghe.com')
             self.assertFalse(saved['features']['some_existing_flag'])
             self.assertEqual(saved['model_providers']['enterprise']['http_headers'], {'Editor-Version': 'existing-header'})
             manage.uninstall(self.dest)
@@ -486,10 +575,12 @@ refresh_interval_ms = 300000
         manage.install(self.config, self.dest, self.port, automatic_context=True)
         old = manage.settings_at(self.dest)
         old['version'] = '1.1.0'
+        old.pop('upstream_url')
         (self.dest/'settings.json').write_text(json.dumps(old), encoding='utf-8')
         # A 1.1.0 install has neither launcher and its helper has no CLI parser.
         (self.dest/'restart.cmd').unlink()
         (self.dest/'update.cmd').unlink()
+        (self.dest/'upstream.py').unlink()
         legacy_helper = b"import json, pathlib, subprocess, sys\ns = json.loads(pathlib.Path(__file__).with_name('settings.json').read_text())\nsys.stdout.buffer.write(subprocess.check_output([s['auth_command'], *s['auth_args']]))\n"
         (self.dest/'auth_bridge.py').write_bytes(legacy_helper)
         config_before = self.config.read_bytes()
@@ -497,7 +588,7 @@ refresh_interval_ms = 300000
         manage.update(self.dest, hostname='enterprise.example.test')
         updated = manage.settings_at(self.dest)
         expected = copy.deepcopy(old)
-        expected.update(version=manage.VERSION, auth_args=auth_bridge.auth_args(old['auth_args'], 'enterprise.example.test'))
+        expected.update(version=manage.VERSION, auth_args=auth_bridge.auth_args(old['auth_args'], 'enterprise.example.test'), upstream_url=DEFAULT_UPSTREAM)
         self.assertEqual(updated, expected)
         self.assertEqual(self.config.read_bytes(), config_before)
         self.assertEqual((self.dest/'config.before.toml').read_bytes(), uninstall_backup)
@@ -515,6 +606,16 @@ refresh_interval_ms = 300000
         self.assertEqual(manage.settings_at(self.dest)['auth_args'][-2:], ['--hostname', 'second.example.test'])
         manage.uninstall(self.dest)
         self.assertEqual(tomllib.loads(self.config.read_text(encoding='utf-8')), tomllib.loads(self.original))
+
+    def test_update_switches_credential_host_and_live_proxy_endpoint_together(self):
+        manage.install(self.config, self.dest, self.port, hostname='microsoft.ghe.com')
+        for hostname, endpoint in (('another.ghe.com', 'https://copilot-api.another.ghe.com'), ('github.com', DEFAULT_UPSTREAM)):
+            manage.update(self.dest, hostname=hostname)
+            state = manage.settings_at(self.dest)
+            self.assertEqual(state['auth_args'][-2:], ['--hostname', hostname])
+            self.assertEqual(state['upstream_url'], endpoint)
+            health = manage.local_json(state['changed']['base_url']+'/health')
+            self.assertEqual(health['upstream_url'], endpoint)
 
     def test_update_verification_failure_restores_old_installation(self):
         manage.install(self.config, self.dest, self.port)

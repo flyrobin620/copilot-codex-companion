@@ -14,6 +14,8 @@ Version 1.1.3 recovers stale local bridge connection fields from matching uninst
 
 Version 1.1.4 adds explicit install --force-config / --force recovery using GitHub CLI authentication, with an exact backup of the prior configuration and support for retrying recognized failed installations.
 
+Version 1.1.5 routes GHE data-residency authentication to its matching copilot-api.<enterprise>.ghe.com endpoint, persists the endpoint for all proxy requests, and reports model-catalog authentication failures without exposing tokens.
+
 The existing test_distribution.py was copied from the development directory and extended for hostname and restart behavior. Its installation tests write disposable fixtures to the sibling distribution-tests directory. Run `python -m unittest -v test_distribution` to verify the updated sources.
 
 This supersedes the earlier 1.0.0 import. Python 3.11 or newer is required; see README.md for usage.
