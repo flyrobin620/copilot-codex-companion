@@ -17,7 +17,7 @@ test('help and version work without Python or installation state', () => {
   assert.equal(main(['--help'], { stdout, spawn }), 0);
   assert.match(stdout.text, /--hostname/);
   assert.equal(main(['--version'], { stdout, spawn }), 0);
-  assert.match(stdout.text, /1\.1\.1/);
+  assert.ok(stdout.text.endsWith(require('../package.json').version + '\n'));
 });
 
 test('Python discovery falls back past missing or unsuitable interpreters', () => {

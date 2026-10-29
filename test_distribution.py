@@ -1,6 +1,7 @@
 import copy
 import io
 import json
+import os
 import socket
 import sys
 import time
@@ -151,6 +152,85 @@ refresh_interval_ms = 300000
             try: manage.local_json(s['changed']['base_url']+'/shutdown',b'',{'X-Compat-Control':s['control']})
             except Exception: pass
 
+    def uninstalled_fixture(self):
+        self.dest.mkdir()
+        # Match the user's legacy 1.0 directory: no settings.json or catalog.py.
+        state = {'version': '1.0.0', 'installation': 'legacy-test', 'config': str(self.config), 'port': self.port}
+        (self.dest/'settings.uninstalled.legacy-test.json').write_text(json.dumps(state), encoding='utf-8')
+        for name in ('auth_bridge.py', 'check.cmd', 'config.before.toml', 'install.cmd', 'manage.py', 'proxy.py', 'README.md', 'uninstall.cmd'):
+            (self.dest/name).write_bytes(('Previous contents: ' + name).encode())
+        (self.dest/'personal-notes.txt').write_text('Keep this unrelated file.', encoding='utf-8')
+        return {p.name: p.read_bytes() for p in self.dest.iterdir()}
+
+    def test_install_reuses_uninstalled_directory_and_preserves_backups(self):
+        previous = self.uninstalled_fixture()
+        manage.install(self.config, self.dest, self.port, hostname='microsoft.ghe.com')
+        backup = next(self.dest.glob('reinstall-backup-*'))
+        self.assertEqual((backup/'config.before.toml').read_bytes(), previous['config.before.toml'])
+        self.assertEqual((backup/'auth_bridge.py').read_bytes(), previous['auth_bridge.py'])
+        for name in ('settings.uninstalled.legacy-test.json', 'personal-notes.txt'):
+            self.assertEqual((self.dest/name).read_bytes(), previous[name])
+        self.assertEqual(manage.settings_at(self.dest)['auth_args'][-2:], ['--hostname', 'microsoft.ghe.com'])
+        self.assertTrue(auth_bridge.healthy(manage.settings_at(self.dest)))
+        manage.uninstall(self.dest)
+        self.assertEqual(tomllib.loads(self.config.read_text(encoding='utf-8')), tomllib.loads(self.original))
+
+    def test_update_reinstalls_legacy_uninstalled_directory(self):
+        self.uninstalled_fixture()
+        manage.update(self.dest, hostname='microsoft.ghe.com')
+        state = manage.settings_at(self.dest)
+        self.assertEqual(state['config'], str(self.config))
+        self.assertEqual(state['port'], self.port)
+        self.assertEqual(state['version'], manage.VERSION)
+        self.assertEqual(state['auth_args'][-2:], ['--hostname', 'microsoft.ghe.com'])
+
+    def test_reinstall_auth_failure_leaves_old_files_untouched(self):
+        previous = self.uninstalled_fixture()
+        with mock.patch.object(manage, 'credential', side_effect=RuntimeError('Synthetic auth failure')):
+            with self.assertRaisesRegex(RuntimeError, 'auth failure'):
+                manage.install(self.config, self.dest, self.port)
+        self.assertEqual({p.name: p.read_bytes() for p in self.dest.iterdir()}, previous)
+        self.assertEqual(self.config.read_text(encoding='utf-8'), self.original)
+
+    def test_reinstall_copy_failure_restores_old_files_and_can_retry(self):
+        previous = self.uninstalled_fixture()
+        with mock.patch.object(manage, 'ensure_defaults', side_effect=RuntimeError('Synthetic catalog failure')):
+            with self.assertRaisesRegex(RuntimeError, 'catalog failure'):
+                manage.install(self.config, self.dest, self.port)
+        self.assertEqual({p.name: p.read_bytes() for p in self.dest.iterdir() if p.is_file()}, previous)
+        self.assertFalse((self.dest/'settings.json').exists())
+        self.assertEqual(self.config.read_text(encoding='utf-8'), self.original)
+        manage.install(self.config, self.dest, self.port)
+        self.assertTrue(auth_bridge.healthy(manage.settings_at(self.dest)))
+
+    def test_unrelated_or_invalid_uninstall_directory_is_not_overwritten(self):
+        self.dest.mkdir()
+        notes = self.dest/'notes.txt'
+        notes.write_text('Keep me', encoding='utf-8')
+        with self.assertRaisesRegex(RuntimeError, 'no valid uninstall state'):
+            manage.install(self.config, self.dest, self.port)
+        marker = self.dest/'settings.uninstalled.old.json'
+        for content, message in (('invalid json', 'Cannot read uninstall state'),
+                                 (json.dumps({'installation': 'old', 'config': str(self.root/'different.toml')}), 'different config')):
+            marker.write_text(content, encoding='utf-8')
+            with self.assertRaisesRegex(RuntimeError, message):
+                manage.install(self.config, self.dest, self.port)
+            self.assertEqual(marker.read_text(encoding='utf-8'), content)
+        self.assertEqual(notes.read_text(encoding='utf-8'), 'Keep me')
+        self.assertFalse((self.dest/'settings.json').exists())
+
+    def test_cli_shows_default_and_resolved_destination(self):
+        env = dict(os.environ, LOCALAPPDATA=str(self.root))
+        result = subprocess.run([sys.executable, str(Path(manage.__file__)), 'update', '--help'],
+                                env=env, capture_output=True, text=True, timeout=10)
+        self.assertEqual(result.returncode, 0)
+        self.assertIn(''.join(str(self.root/'CodexCopilotCompat').split()), ''.join(result.stdout.split()))
+        result = subprocess.run([sys.executable, str(Path(manage.__file__)), 'update', '--dest', str(self.root/'missing')],
+                                capture_output=True, text=True, timeout=10)
+        self.assertEqual(result.returncode, 1)
+        self.assertIn('Installation directory: ' + str(self.root/'missing'), result.stdout)
+        self.assertIn(str(self.root/'missing'), result.stderr)
+
     def test_install_repeat_check_restore_preserves_other_edits(self):
         manage.install(self.config,self.dest,self.port)
         cfg=tomllib.loads(self.config.read_text(encoding='utf-8'))
@@ -266,6 +346,8 @@ refresh_interval_ms = 300000
         self.assertEqual(json.loads((backup/'settings.json').read_text()), old)
         self.assertTrue((self.dest/'update.cmd').is_file())
         self.assertTrue(auth_bridge.healthy(updated))
+        updated['version'] = '1.1.1'
+        (self.dest/'settings.json').write_text(json.dumps(updated), encoding='utf-8')
         # The installed package can be reused to change hostname, then updated
         # without an override while retaining that choice.
         manage.update(self.dest, hostname='second.example.test', source=self.dest)

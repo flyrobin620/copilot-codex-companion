@@ -3,6 +3,7 @@ import sys
 if sys.version_info < (3, 11):
     raise SystemExit('Python 3.11 or newer is required. No configuration was changed.')
 import argparse
+import contextlib
 import copy
 import json
 import os
@@ -19,7 +20,7 @@ from pathlib import Path
 from catalog import ensure_defaults
 from auth_bridge import auth_args, restart_bridge, start_bridge, stop_bridge
 
-VERSION = '1.1.1'
+VERSION = '1.1.2'
 UPSTREAM = 'https://api.enterprise.githubcopilot.com'
 FILES = ('proxy.py', 'catalog.py', 'auth_bridge.py', 'manage.py', 'install.cmd', 'check.cmd', 'restart.cmd', 'update.cmd', 'uninstall.cmd', 'README.md')
 CONTEXT_KEYS = ('model_context_window','model_auto_compact_token_limit')
@@ -90,6 +91,46 @@ def settings_at(dest):
     return json.loads((dest/'settings.json').read_text(encoding='utf-8'))
 
 
+def uninstalled_state(dest):
+    markers = sorted(dest.glob('settings.uninstalled.*.json'), key=lambda p: p.stat().st_mtime_ns, reverse=True)
+    if not markers:
+        return None
+    marker = markers[0]
+    try:
+        state = json.loads(marker.read_text(encoding='utf-8'))
+        if (not isinstance(state, dict) or not isinstance(state.get('config'), str)
+                or not state['config'] or not state.get('installation')
+                or marker.name != f"settings.uninstalled.{state['installation']}.json"):
+            raise ValueError('Invalid uninstall state')
+        return state
+    except (OSError, ValueError):
+        raise RuntimeError(f'Cannot read uninstall state at {marker}; existing files were preserved.') from None
+
+
+@contextlib.contextmanager
+def preserve_uninstalled_files(dest, reinstall):
+    if not reinstall:
+        yield
+        return
+    names = (*FILES, 'settings.json', 'catalog-defaults.json', 'config.before.toml')
+    previous = {name: (dest/name).read_bytes() if (dest/name).exists() else None for name in names}
+    backup = Path(tempfile.mkdtemp(prefix='reinstall-backup-', dir=dest))
+    for name, data in previous.items():
+        if data is not None:
+            (backup/name).write_bytes(data)
+    print(f'Uninstalled installation detected. Previous files backed up to: {backup}')
+    try:
+        yield
+    except Exception:
+        for name, data in previous.items():
+            if data is None:
+                (dest/name).unlink(missing_ok=True)
+            else:
+                write_atomic(dest/name, data)
+        print(f'Reinstall failed; previous files restored. Backup retained at {backup}', file=sys.stderr)
+        raise
+
+
 def catalog_check(state,cfg,token):
     p=cfg['model_providers'][state['provider']]
     headers=dict(p.get('http_headers',{}))
@@ -103,7 +144,7 @@ def catalog_check(state,cfg,token):
     return selected
 
 
-def install(config, dest, port, automatic_context=False, codex_command='codex', hostname=None):
+def install(config, dest, port, automatic_context=False, codex_command='codex', hostname=None, source=None):
     if os.name != 'nt':
         raise RuntimeError('This package supports Windows only.')
     if (dest/'settings.json').exists():
@@ -112,8 +153,13 @@ def install(config, dest, port, automatic_context=False, codex_command='codex', 
             raise RuntimeError('This installation belongs to a different config. Choose another --dest and --port.')
         print('Already installed. Use update.cmd to update or change --hostname, or check.cmd to verify.')
         return
+    reinstall = None
     if dest.exists() and any(dest.iterdir()):
-        raise RuntimeError('Destination is not empty. Choose another --dest; existing files will not be overwritten.')
+        reinstall = uninstalled_state(dest)
+        if reinstall is None:
+            raise RuntimeError(f'Destination {dest} is not empty and has no valid uninstall state. Choose another --dest; existing files will not be overwritten.')
+        if Path(reinstall['config']).resolve() != config.resolve():
+            raise RuntimeError('Uninstalled files belong to a different config. Use its --config or choose another --dest.')
     if not config.is_file():
         raise RuntimeError('No Codex config found. Configure a working Copilot Enterprise connection first.')
     original = config.read_text(encoding='utf-8-sig')
@@ -167,43 +213,45 @@ def install(config, dest, port, automatic_context=False, codex_command='codex', 
         expected.pop(key)
     if tomllib.loads(updated) != expected:
         raise RuntimeError('Configuration validation failed; no configuration was changed.')
-    source = Path(__file__).resolve().parent
-    dest.mkdir(parents=True, exist_ok=True)
-    for name in FILES:
-        shutil.copy2(source/name, dest/name)
-    ensure_defaults(dest,codex_command)
-    state = {'version': VERSION, 'installation': secrets.token_hex(16), 'control': secrets.token_hex(32),
-             'config': str(config), 'runtime':str(dest), 'codex_command':codex_command,
-             'removed_context_overrides':removed_context, 'provider': provider, 'port': port, 'auth_command': command,
-             'auth_args': args, 'auth_timeout_ms': timeout, 'changed': changed,
-             'old': {'base_url':p['base_url'], 'command':a['command'], 'args':a.get('args'), 'timeout_ms':a.get('timeout_ms')},
-             'old_present': {k: k in a for k in ('args', 'timeout_ms')}}
-    (dest/'config.before.toml').write_text(original, encoding='utf-8')
-    (dest/'settings.json').write_text(json.dumps(state, indent=2), encoding='utf-8')
-    try:
-        # Start and verify the installed runtime before changing the active connection.
-        r = subprocess.run([sys.executable, str(dest/'auth_bridge.py')], capture_output=True,
-                           timeout=changed['timeout_ms']/1000)
-        if r.returncode or not r.stdout.strip():
-            raise RuntimeError('Installed helper did not start successfully; active configuration remains unchanged.')
-        health = local_json(changed['base_url']+'/health')
-        if health.get('installation') != state['installation']:
-            raise RuntimeError('Unexpected service on local port; active configuration remains unchanged.')
-        selected=catalog_check(state,cfg,r.stdout.strip())
-        print('Catalog verified: '+selected['slug']+' input context='+str(selected['context_window']))
-        replace_config(config, original, updated)
-    except Exception:
+    source = source or Path(__file__).resolve().parent
+    payload = {name: (source/name).read_bytes() for name in FILES}
+    with preserve_uninstalled_files(dest, reinstall):
+        dest.mkdir(parents=True, exist_ok=True)
+        for name, data in payload.items():
+            write_atomic(dest/name, data)
+        ensure_defaults(dest,codex_command)
+        state = {'version': VERSION, 'installation': secrets.token_hex(16), 'control': secrets.token_hex(32),
+                 'config': str(config), 'runtime':str(dest), 'codex_command':codex_command,
+                 'removed_context_overrides':removed_context, 'provider': provider, 'port': port, 'auth_command': command,
+                 'auth_args': args, 'auth_timeout_ms': timeout, 'changed': changed,
+                 'old': {'base_url':p['base_url'], 'command':a['command'], 'args':a.get('args'), 'timeout_ms':a.get('timeout_ms')},
+                 'old_present': {k: k in a for k in ('args', 'timeout_ms')}}
+        (dest/'config.before.toml').write_text(original, encoding='utf-8')
+        (dest/'settings.json').write_text(json.dumps(state, indent=2), encoding='utf-8')
         try:
-            local_json(changed['base_url']+'/shutdown', b'', {'X-Compat-Control':state['control']})
+            # Start and verify the installed runtime before changing the active connection.
+            r = subprocess.run([sys.executable, str(dest/'auth_bridge.py')], capture_output=True,
+                               timeout=changed['timeout_ms']/1000)
+            if r.returncode or not r.stdout.strip():
+                raise RuntimeError('Installed helper did not start successfully; active configuration remains unchanged.')
+            health = local_json(changed['base_url']+'/health')
+            if health.get('installation') != state['installation']:
+                raise RuntimeError('Unexpected service on local port; active configuration remains unchanged.')
+            selected=catalog_check(state,cfg,r.stdout.strip())
+            print('Catalog verified: '+selected['slug']+' input context='+str(selected['context_window']))
+            replace_config(config, original, updated)
         except Exception:
-            pass
-        (dest/'settings.json').rename(dest/'settings.failed.json')
-        raise
-    print(f'Installed {VERSION} in {dest}')
-    print('Existing provider, model, headers and login were preserved. No credential was printed.')
-    if removed_context:
-        print('Manual context/compaction overrides removed after catalog validation; uninstall can restore them.')
-    print('Finish active tasks, fully exit and reopen Codex, then test in a new chat.')
+            try:
+                local_json(changed['base_url']+'/shutdown', b'', {'X-Compat-Control':state['control']})
+            except Exception:
+                pass
+            (dest/'settings.json').rename(dest/'settings.failed.json')
+            raise
+        print(f'Installed {VERSION} in {dest}')
+        print('Existing provider, model, headers and login were preserved. No credential was printed.')
+        if removed_context:
+            print('Manual context/compaction overrides removed after catalog validation; uninstall can restore them.')
+        print('Finish active tasks, fully exit and reopen Codex, then test in a new chat.')
 
 
 def write_atomic(path, data):
@@ -216,13 +264,19 @@ def write_atomic(path, data):
         temporary.unlink(missing_ok=True)
 
 
-def update(dest, hostname=None, source=None):
+def update(dest, hostname=None, source=None, config=None, port=None, automatic_context=False, codex_command=None):
     """Update an existing 1.1 installation, retaining its identity and uninstall state."""
     if os.name != 'nt':
         raise RuntimeError('This package supports Windows only.')
     dest = dest.resolve()
     if not (dest/'settings.json').is_file():
-        raise RuntimeError('No installation found at --dest. Use install.cmd for a new installation.')
+        previous = uninstalled_state(dest)
+        if previous is not None:
+            print('The previous installation was uninstalled; reinstalling from the current package.')
+            return install(config or Path(previous['config']), dest,
+                           port if port is not None else previous.get('port', 43129),
+                           automatic_context, codex_command or previous.get('codex_command', 'codex'), hostname, source)
+        raise RuntimeError(f'No active installation or uninstall state found at {dest}. Use install.cmd for a new installation.')
     lock = dest/'update.lock'
     try:
         handle = lock.open('x')
@@ -237,8 +291,8 @@ def update(dest, hostname=None, source=None):
 
 def _update(dest, hostname, source):
     state = settings_at(dest)
-    if state.get('version') not in ('1.1.0', VERSION):
-        raise RuntimeError('Only existing 1.1.0 and 1.1.1 installations are supported.')
+    if state.get('version') not in ('1.1.0', '1.1.1', VERSION):
+        raise RuntimeError('Only existing 1.1.0, 1.1.1 and 1.1.2 installations are supported.')
     if Path(state['runtime']).resolve() != dest:
         raise RuntimeError('Installation path mismatch. Use the original installation directory.')
     cfg = tomllib.loads(Path(state['config']).read_text(encoding='utf-8-sig'))
@@ -376,25 +430,29 @@ def uninstall(dest):
 
 
 def main():
+    here = Path(__file__).resolve().parent
+    default_dest = Path(os.environ.get('LOCALAPPDATA', str(Path.home()/'AppData/Local')))/'CodexCopilotCompat'
+    if (here/'settings.json').exists() or any(here.glob('settings.uninstalled.*.json')):
+        default_dest = here
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('action', choices=['install', 'update', 'check', 'restart', 'uninstall'])
-    parser.add_argument('--port', type=int, default=43129)
-    parser.add_argument('--dest', type=Path)
+    parser.add_argument('--port', type=int, help='Local port for installation (default: 43129; reinstall via update reuses the saved port).')
+    parser.add_argument('--dest', type=Path, help=f'Installation directory (default: {default_dest.resolve()}).')
     parser.add_argument('--config', type=Path)
     parser.add_argument('--live', action='store_true')
     parser.add_argument('--hostname', help='Persist the credential helper hostname when installing or updating.')
     parser.add_argument('--automatic-context',action='store_true',help='Remove manual context/compaction overrides after validating the live model catalog.')
-    parser.add_argument('--codex',default='codex',help='Path to the Codex binary used by the desktop app; used for matching bundled defaults.')
+    parser.add_argument('--codex',help='Path to the matching Codex binary (default: codex; reinstall via update reuses the saved command).')
     options = parser.parse_args()
     if options.hostname is not None and options.action not in ('install', 'update'):
         parser.error('--hostname is only supported with install or update.')
-    here = Path(__file__).resolve().parent
-    default_dest = Path(os.environ.get('LOCALAPPDATA', str(Path.home()/'AppData/Local')))/'CodexCopilotCompat'
-    dest = (options.dest or (here if (here/'settings.json').exists() else default_dest)).resolve()
+    dest = (options.dest or default_dest).resolve()
     config = (options.config or Path(os.environ.get('CODEX_HOME', str(Path.home()/'.codex')))/'config.toml').resolve()
     try:
-        if options.action == 'install': install(config, dest, options.port,options.automatic_context,options.codex,options.hostname)
-        elif options.action == 'update': update(dest, options.hostname)
+        print(f'Installation directory: {dest}')
+        if options.action == 'install': install(config, dest, options.port if options.port is not None else 43129,options.automatic_context,options.codex or 'codex',options.hostname)
+        elif options.action == 'update': update(dest, options.hostname, config=config if options.config else None,
+                                               port=options.port, automatic_context=options.automatic_context, codex_command=options.codex)
         elif options.action == 'check': check(dest, options.live)
         elif options.action == 'restart':
             restart_bridge(dest, settings_at(dest))

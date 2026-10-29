@@ -1,4 +1,4 @@
-# Copilot Codex Companion 1.1.1
+# Copilot Codex Companion 1.1.2
 
 Windows 本机兼容方案。包含消息 ID 修复和 Codex 模型目录适配。非 OpenAI/GitHub 官方补丁。采用 [MIT 许可证](LICENSE)。
 
@@ -30,7 +30,7 @@ cd copilot-codex-companion
 
 前提：Python 3.11+（含 pythonw.exe）、已有可用的 Codex → Copilot Enterprise Responses HTTP 连接和命令式认证，以及与桌面应用匹配的 codex.exe。无需 ChatGPT 账号、管理员权限或第三方 Python 库。
 
-1. 解压整个 ZIP。已有 1.0.0 安装时，先用旧版 uninstall.cmd 卸载，再安装到新目录，或将旧安装目录改名保留。
+1. 解压整个 ZIP。已有 1.0.0 活动安装时，先用旧版 uninstall.cmd 卸载，再安装；旧版卸载留下的目录现在可以直接复用，脚本会保留旧备份。
 2. 要让上游目录自动管理上下文，在解压目录打开终端，运行：
 
    ```powershell
@@ -71,6 +71,22 @@ Copilot CLI、GitHub CLI（gh）和 Codex CLI 是不同工具。安装器复用�
 ```
 
 `update.cmd` 需要同目录的完整程序文件，不能只复制这一个脚本。命令行自动化可使用 `python manage.py update --dest "D:\Tools\CodexCopilotCompat" --hostname git.example.com`，避免 `.cmd` 结束时的按键暂停。
+
+### 卸载残留目录与默认路径
+
+如果目录没有 `settings.json`，但存在 `settings.uninstalled.*.json`，说明旧版已经卸载。1.1.2 的 `install.cmd` 可以直接重新安装；`update.cmd` 也会识别此状态并自动转入安装，复用卸载记录中的配置路径、端口和 Codex 命令（可通过参数覆盖）。新安装以当前 config.toml 中已恢复的认证命令为准，`--hostname` 继续生效。
+
+重新安装前会将旧程序、原配置备份及目录快照保存到 `reinstall-backup-*`；原卸载记录和其他文件保持不变。认证预检查失败时不改旧文件，重新安装失败时恢复旧程序和备份。无法识别的非空目录仍不会被覆盖。
+
+```powershell
+git pull --ff-only
+.\update.cmd --hostname microsoft.ghe.com
+
+# 查看实际默认目录
+python manage.py update --help
+```
+
+脚本每次运行都会打印 `Installation directory:`。默认目录为 `%LOCALAPPDATA%\CodexCopilotCompat`；若脚本目录已有活动安装或卸载记录，则默认使用脚本目录。`--dest` 可以显式指定目标目录。
 
 ## 1.1.0 新增什么
 
@@ -142,7 +158,7 @@ Copilot CLI、GitHub CLI（gh）和 Codex CLI 是不同工具。安装器复用�
 
 重启会校验安装身份，使用本机管理密钥关闭服务，等待端口释放后重新启动并检查健康状态；服务原本未运行时直接启动。请等活动请求结束后再重启，以免中断正在生成的回复。无法确认服务身份或停止状态时会报错，不终止其他进程。
 
-- 若默认目录不为空，安装器不会覆盖；先卸载并保留/改名旧目录，或选择新 --dest。
+- 目录包含有效的卸载记录时，可以直接重新安装；无法识别的非空目录需要选择其他 `--dest`。
 - 若 Codex 升级后提示目录版本不匹配，确认 PATH 中 codex.exe 与桌面自带运行时一致；必要时用匹配的 --codex 路径重新安装。
 - 如果认证失败，先修复该机器原来的认证命令，不需要复制其他机器的令牌。
 - 使用环境变量 API key、ChatGPT 认证、WebSocket、复杂 TOML 表/多行数组或由 profile/组织策略覆盖的配置，不在自动迁移覆盖范围内；安装器可能拒绝修改。
@@ -150,7 +166,7 @@ Copilot CLI、GitHub CLI（gh）和 Codex CLI 是不同工具。安装器复用�
 
 ## 验证
 
-本次更新使用 `python -m unittest -v test_distribution` 验证 19 项测试，覆盖 ID 归一化、模型能力转换、安装/卸载、上下文恢复、hostname 保留与覆盖、服务重启、身份校验、停止超时、旧版原地更新、更新失败回退、更新前检查及中文和空格路径。认证使用合成测试凭据，模型目录检查使用测试替身。
+本次更新使用 `python -m unittest -v test_distribution` 验证 25 项测试，覆盖 ID 归一化、模型能力转换、安装/卸载、卸载残留目录重装与失败恢复、默认路径提示、上下文恢复、hostname 保留与覆盖、服务重启、身份校验、停止超时、旧版原地更新、更新失败回退、更新前检查及中文和空格路径。认证使用合成测试凭据，模型目录检查使用测试替身。
 
 `npm test` 另验证 Node 命令入口的 Python 探测、参数转发、退出码和异常处理；npm 包可通过本地 `.tgz` 执行测试，无需发布到 registry。
 
@@ -183,12 +199,12 @@ npx --yes copilot-codex-companion@latest check
 npx --yes copilot-codex-companion@latest uninstall
 ```
 
-`@latest` 请求 registry 当前的 latest 版本；可换成 `@1.1.1` 固定版本。每次 `update` 都会执行原有的备份、校验和失败回退流程。安装后的服务使用 `%LOCALAPPDATA%\CodexCopilotCompat`（或 `--dest`），不依赖 npm 缓存路径；npx 退出后服务继续运行。等待活动任务结束并退出 Codex 后再更新，成功后重新打开 Codex 刷新凭据。
+`@latest` 请求 registry 当前的 latest 版本；可换成 `@1.1.2` 固定版本。每次 `update` 都会执行原有的备份、校验和失败回退流程。安装后的服务使用 `%LOCALAPPDATA%\CodexCopilotCompat`（或 `--dest`），不依赖 npm 缓存路径；npx 退出后服务继续运行。等待活动任务结束并退出 Codex 后再更新，成功后重新打开 Codex 刷新凭据。
 
 尚未发布时，可将 `npm pack` 生成的 `.tgz` 传到另一台电脑，直接通过 npx 使用：
 
 ```powershell
-npx --yes --package .\copilot-codex-companion-1.1.1.tgz copilot-codex-companion update --hostname git.example.com
+npx --yes --package .\copilot-codex-companion-1.1.2.tgz copilot-codex-companion update --hostname git.example.com
 ```
 
 维护者发布步骤：

@@ -11,4 +11,5 @@ settings*.json
 config.before.toml
 catalog-defaults.json
 update-backup-*/
+reinstall-backup-*/
 update.lock
