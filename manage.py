@@ -15,12 +15,13 @@ import subprocess
 import tempfile
 import tomllib
 import urllib.error
+import urllib.parse
 import urllib.request
 from pathlib import Path
 from catalog import ensure_defaults
 from auth_bridge import auth_args, restart_bridge, start_bridge, stop_bridge
 
-VERSION = '1.1.2'
+VERSION = '1.1.3'
 UPSTREAM = 'https://api.enterprise.githubcopilot.com'
 FILES = ('proxy.py', 'catalog.py', 'auth_bridge.py', 'manage.py', 'install.cmd', 'check.cmd', 'restart.cmd', 'update.cmd', 'uninstall.cmd', 'README.md')
 CONTEXT_KEYS = ('model_context_window','model_auto_compact_token_limit')
@@ -144,6 +145,68 @@ def catalog_check(state,cfg,token):
     return selected
 
 
+def connection_details(config, provider, settings):
+    value = settings.get('base_url')
+    if not value:
+        safe_url = '<missing>'
+    else:
+        try:
+            parts = urllib.parse.urlsplit(value)
+            host = parts.hostname
+            if not parts.scheme or not host:
+                raise ValueError('Invalid URL')
+            if ':' in host:
+                host = '[' + host + ']'
+            if parts.port is not None:
+                host += ':' + str(parts.port)
+            safe_url = urllib.parse.urlunsplit((parts.scheme, host, parts.path, '', ''))
+        except (ValueError, TypeError):
+            safe_url = '<invalid URL>'
+    return (f"Config: {config}; provider: {provider}; base_url: {safe_url}; "
+            f"wire_api: {settings.get('wire_api', 'responses')!r}.")
+
+
+def recover_uninstalled_connection(original, cfg, state):
+    """Normalize a stale, recorded bridge connection in memory before reinstalling."""
+    if not state:
+        return original
+    provider = cfg.get('model_provider')
+    p = cfg.get('model_providers', {}).get(provider, {})
+    changed = state.get('changed', {})
+    if not changed.get('base_url') or p.get('base_url') != changed['base_url']:
+        return original
+    old = state.get('old', {})
+    if (provider != state.get('provider')
+            or changed['base_url'] != f"http://127.0.0.1:{state.get('port')}"
+            or old.get('base_url', '').rstrip('/') != UPSTREAM
+            or not old.get('command')
+            or any(key not in changed or key not in old for key in ('base_url', 'command', 'args', 'timeout_ms'))):
+        raise RuntimeError('The configuration points to an old bridge, but its uninstall record cannot safely restore the original connection.')
+    restored = original
+    expected = copy.deepcopy(cfg)
+    section = 'model_providers.' + provider
+    for key in ('base_url', 'command', 'args', 'timeout_ms'):
+        actual_fields = p if key == 'base_url' else p.get('auth', {})
+        remove = key in ('args', 'timeout_ms') and not state.get('old_present', {}).get(key, old[key] is not None)
+        # A previous uninstall may have restored some fields already. Preserve
+        # those, but never silently overwrite a third, manually edited value.
+        already_restored = key not in actual_fields if remove else key in actual_fields and actual_fields[key] == old[key]
+        if already_restored:
+            continue
+        if key not in actual_fields or actual_fields[key] != changed[key]:
+            raise RuntimeError(f'Cannot recover modified connection field {key!r} from the uninstall record; current configuration was preserved.')
+        restored = field(restored, section if key == 'base_url' else section+'.auth', key, old[key], remove)
+        target = expected['model_providers'][provider] if key == 'base_url' else expected['model_providers'][provider]['auth']
+        if remove:
+            target.pop(key, None)
+        else:
+            target[key] = old[key]
+    if tomllib.loads(restored) != expected:
+        raise RuntimeError('Recovered connection validation failed; current configuration was preserved.')
+    print('Stale bridge connection detected; using the original connection from the uninstall record.')
+    return restored
+
+
 def install(config, dest, port, automatic_context=False, codex_command='codex', hostname=None, source=None):
     if os.name != 'nt':
         raise RuntimeError('This package supports Windows only.')
@@ -164,14 +227,20 @@ def install(config, dest, port, automatic_context=False, codex_command='codex', 
         raise RuntimeError('No Codex config found. Configure a working Copilot Enterprise connection first.')
     original = config.read_text(encoding='utf-8-sig')
     cfg = tomllib.loads(original)
+    connection_original = recover_uninstalled_connection(original, cfg, reinstall)
+    cfg = tomllib.loads(connection_original)
     provider = cfg.get('model_provider', '')
     if not re.fullmatch(r'[A-Za-z0-9_-]+', provider):
         raise RuntimeError('A simple, top-level custom model_provider name is required.')
     p = cfg.get('model_providers', {}).get(provider, {})
     if cfg.get('model_catalog_json') or p.get('model_catalog_url'):
         raise RuntimeError('An explicit model catalog is configured. Resolve that override before installing this catalog adapter.')
-    if p.get('base_url', '').rstrip('/') != UPSTREAM or p.get('wire_api', 'responses') != 'responses':
-        raise RuntimeError('This package requires an existing Copilot Enterprise Responses connection.')
+    details = connection_details(config, provider, p)
+    if p.get('wire_api', 'responses') != 'responses':
+        raise RuntimeError('This adapter requires wire_api = "responses". ' + details)
+    if p.get('base_url', '').rstrip('/') != UPSTREAM:
+        raise RuntimeError('The selected provider does not use the supported Copilot API URL. ' + details
+                           + f' Expected base_url: {UPSTREAM}. --hostname selects the credential host, not the API URL.')
     if p.get('supports_websockets'):
         raise RuntimeError('This adapter supports HTTP/SSE only. WebSocket configuration was left unchanged.')
     a = p.get('auth', {})
@@ -200,7 +269,7 @@ def install(config, dest, port, automatic_context=False, codex_command='codex', 
     credential(command, args, timeout)
     changed = {'base_url': f'http://127.0.0.1:{port}', 'command': sys.executable,
                'args': [str(dest/'auth_bridge.py')], 'timeout_ms': max(15000, timeout+7000)}
-    updated = original
+    updated = connection_original
     section = 'model_providers.' + provider
     for key, value in changed.items():
         updated = field(updated, section if key == 'base_url' else section+'.auth', key, value)
@@ -226,7 +295,7 @@ def install(config, dest, port, automatic_context=False, codex_command='codex', 
                  'auth_args': args, 'auth_timeout_ms': timeout, 'changed': changed,
                  'old': {'base_url':p['base_url'], 'command':a['command'], 'args':a.get('args'), 'timeout_ms':a.get('timeout_ms')},
                  'old_present': {k: k in a for k in ('args', 'timeout_ms')}}
-        (dest/'config.before.toml').write_text(original, encoding='utf-8')
+        (dest/'config.before.toml').write_text(connection_original, encoding='utf-8')
         (dest/'settings.json').write_text(json.dumps(state, indent=2), encoding='utf-8')
         try:
             # Start and verify the installed runtime before changing the active connection.
@@ -291,8 +360,8 @@ def update(dest, hostname=None, source=None, config=None, port=None, automatic_c
 
 def _update(dest, hostname, source):
     state = settings_at(dest)
-    if state.get('version') not in ('1.1.0', '1.1.1', VERSION):
-        raise RuntimeError('Only existing 1.1.0, 1.1.1 and 1.1.2 installations are supported.')
+    if state.get('version') not in ('1.1.0', '1.1.1', '1.1.2', VERSION):
+        raise RuntimeError('Only existing 1.1.0 through 1.1.3 installations are supported.')
     if Path(state['runtime']).resolve() != dest:
         raise RuntimeError('Installation path mismatch. Use the original installation directory.')
     cfg = tomllib.loads(Path(state['config']).read_text(encoding='utf-8-sig'))

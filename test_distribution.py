@@ -68,6 +68,23 @@ class AuthBridgeTests(unittest.TestCase):
             self.assertEqual(request.get_header('X-compat-control'), 'test-control')
 
 
+class ConnectionDiagnosticsTests(unittest.TestCase):
+    def test_connection_details_redact_url_credentials(self):
+        details = manage.connection_details(Path('custom.toml'), 'enterprise', {
+            'base_url': 'https://user:URL_SECRET@api.example.test/v1?token=QUERY_SECRET#FRAGMENT_SECRET',
+            'wire_api': 'chat', 'auth': {'command': 'gh', 'args': ['SECRET_ARG']},
+        })
+        self.assertIn('custom.toml', details)
+        self.assertIn('https://api.example.test/v1', details)
+        self.assertIn("wire_api: 'chat'", details)
+        for secret in ('URL_SECRET', 'QUERY_SECRET', 'FRAGMENT_SECRET', 'SECRET_ARG'):
+            self.assertNotIn(secret, details)
+
+    def test_connection_details_handle_missing_and_invalid_urls(self):
+        for value, expected in ((None, '<missing>'), ('not a url', '<invalid URL>'), ('https://host:bad', '<invalid URL>')):
+            self.assertIn(expected, manage.connection_details(Path('config.toml'), 'enterprise', {'base_url': value}))
+
+
 class CatalogTests(unittest.TestCase):
     def fixture(self):
         defaults={'models':[{'slug':'known','context_window':272000,'max_context_window':872000,
@@ -161,6 +178,71 @@ refresh_interval_ms = 300000
             (self.dest/name).write_bytes(('Previous contents: ' + name).encode())
         (self.dest/'personal-notes.txt').write_text('Keep this unrelated file.', encoding='utf-8')
         return {p.name: p.read_bytes() for p in self.dest.iterdir()}
+
+    def stale_uninstalled_fixture(self, original_auth=False):
+        self.uninstalled_fixture()
+        marker = self.dest/'settings.uninstalled.legacy-test.json'
+        state = json.loads(marker.read_text(encoding='utf-8'))
+        cfg = tomllib.loads(self.original)
+        p = cfg['model_providers']['enterprise']
+        a = p['auth']
+        state.update(provider='enterprise', auth_command=a['command'], auth_args=a['args'], auth_timeout_ms=5000,
+                     changed={'base_url': f'http://127.0.0.1:{self.port}', 'command': sys.executable,
+                              'args': [str(self.dest/'auth_bridge.py')], 'timeout_ms': 15000},
+                     old={'base_url': p['base_url'], 'command': a['command'], 'args': a['args'], 'timeout_ms': None},
+                     old_present={'args': True, 'timeout_ms': False})
+        marker.write_text(json.dumps(state), encoding='utf-8')
+        text = self.original.replace('some_existing_flag = true', 'some_existing_flag = false')
+        for key, value in state['changed'].items():
+            if original_auth and key != 'base_url':
+                continue
+            section = 'model_providers.enterprise' + ('' if key == 'base_url' else '.auth')
+            text = manage.field(text, section, key, value)
+        self.config.write_text(text, encoding='utf-8')
+        return state
+
+    def test_reinstall_recovers_stale_bridge_and_uninstall_uses_upstream(self):
+        record = self.stale_uninstalled_fixture()
+        expected = tomllib.loads(self.original)
+        expected['features']['some_existing_flag'] = False
+        manage.update(self.dest, hostname='microsoft.ghe.com')
+        state = manage.settings_at(self.dest)
+        self.assertEqual(state['old'], record['old'])
+        self.assertEqual(state['auth_args'][-2:], ['--hostname', 'microsoft.ghe.com'])
+        self.assertNotIn(str(self.dest/'auth_bridge.py'), state['auth_args'])
+        self.assertEqual(tomllib.loads((self.dest/'config.before.toml').read_text(encoding='utf-8')), expected)
+        self.assertTrue(auth_bridge.healthy(state))
+        manage.uninstall(self.dest)
+        self.assertEqual(tomllib.loads(self.config.read_text(encoding='utf-8')), expected)
+
+    def test_recovery_handles_already_restored_auth_fields(self):
+        record = self.stale_uninstalled_fixture(original_auth=True)
+        text = self.config.read_text(encoding='utf-8')
+        restored = manage.recover_uninstalled_connection(text, tomllib.loads(text), record)
+        expected = tomllib.loads(self.original)
+        expected['features']['some_existing_flag'] = False
+        self.assertEqual(tomllib.loads(restored), expected)
+        self.assertEqual(self.config.read_text(encoding='utf-8'), text)
+
+    def test_recovery_auth_failure_does_not_change_config_or_old_files(self):
+        self.stale_uninstalled_fixture()
+        before = self.config.read_bytes()
+        files = {p.name: p.read_bytes() for p in self.dest.iterdir()}
+        with mock.patch.object(manage, 'credential', side_effect=RuntimeError('Synthetic auth failure')):
+            with self.assertRaisesRegex(RuntimeError, 'auth failure'):
+                manage.update(self.dest, hostname='microsoft.ghe.com')
+        self.assertEqual(self.config.read_bytes(), before)
+        self.assertEqual({p.name: p.read_bytes() for p in self.dest.iterdir()}, files)
+
+    def test_recovery_refuses_modified_bridge_auth_args(self):
+        self.stale_uninstalled_fixture()
+        text = manage.field(self.config.read_text(encoding='utf-8'), 'model_providers.enterprise.auth', 'args', ['newer-helper.py'])
+        self.config.write_text(text, encoding='utf-8')
+        with mock.patch.object(manage, 'credential') as credential:
+            with self.assertRaisesRegex(RuntimeError, 'modified connection field'):
+                manage.update(self.dest)
+            credential.assert_not_called()
+        self.assertEqual(self.config.read_text(encoding='utf-8'), text)
 
     def test_install_reuses_uninstalled_directory_and_preserves_backups(self):
         previous = self.uninstalled_fixture()
