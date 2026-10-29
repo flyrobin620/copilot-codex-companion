@@ -1,0 +1,4 @@
+* text=auto eol=lf
+*.cmd -text whitespace=cr-at-eol
+*.zip binary
+*.tgz binary

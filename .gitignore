@@ -1,0 +1,14 @@
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.env
+.env.*
+*.log
+dist/
+node_modules/
+settings*.json
+config.before.toml
+catalog-defaults.json
+update-backup-*/
+update.lock

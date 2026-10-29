@@ -1,0 +1,38 @@
+{
+  "name": "copilot-codex-companion",
+  "version": "1.1.1",
+  "description": "Windows loopback compatibility bridge for an existing Codex to Copilot Enterprise connection",
+  "license": "MIT",
+  "bin": {
+    "copilot-codex-companion": "bin/cli.cjs"
+  },
+  "os": [
+    "win32"
+  ],
+  "engines": {
+    "node": ">=20"
+  },
+  "files": [
+    "bin/cli.cjs",
+    "auth_bridge.py",
+    "catalog.py",
+    "manage.py",
+    "proxy.py",
+    "install.cmd",
+    "update.cmd",
+    "restart.cmd",
+    "check.cmd",
+    "uninstall.cmd",
+    "README.md",
+    "SHA256SUMS.txt",
+    "LICENSE"
+  ],
+  "scripts": {
+    "test": "node --test test/cli.test.cjs",
+    "prepack": "node scripts/prepare-pack.cjs"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/flyrobin620/copilot-codex-companion.git"
+  }
+}
