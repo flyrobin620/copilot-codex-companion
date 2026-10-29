@@ -1,4 +1,4 @@
-# Copilot Codex Companion 1.1.3
+# Copilot Codex Companion 1.1.4
 
 Windows 本机兼容方案。包含消息 ID 修复和 Codex 模型目录适配。非 OpenAI/GitHub 官方补丁。采用 [MIT 许可证](LICENSE)。
 
@@ -92,6 +92,22 @@ python manage.py update --help
 
 脚本每次运行都会打印 `Installation directory:`。默认目录为 `%LOCALAPPDATA%\CodexCopilotCompat`；若脚本目录已有活动安装或卸载记录，则默认使用脚本目录。`--dest` 可以显式指定目标目录。
 
+### 已删除安装目录：强制重建配置
+
+删除安装目录不会恢复 config.toml。如果旧连接仍指向 `http://127.0.0.1:43129`，且卸载记录已经丢失，可显式指定 GitHub CLI 认证来重建连接：
+
+```powershell
+git pull --ff-only
+.\install.cmd --force-config --hostname microsoft.ghe.com
+# --force 是 --force-config 的别名
+```
+
+`--force-config` 仅用于 `install`，会覆盖当前自定义 provider 的 `base_url`、`wire_api`、认证 `command` 和 `args`，重建为 Copilot Enterprise Responses 上游和 `gh auth token --hostname HOST`。省略 hostname 时使用 `gh auth token` 自身的默认选择，不写死域名。模型、请求头和其他配置保留。
+
+脚本先验证 gh 认证，再将原始配置逐字节备份到 config.toml 同目录的 `config.toml.before-force-*.bak`（自定义配置文件使用其自己的文件名）。新 bridge 和模型目录验证通过后才写入活动配置。安装目录中的 `config.before.toml` 保存重建后的直连配置，供将来卸载恢复。失败安装留下有效 `settings.failed.json` 时，可以原命令重试，不必再删除目录。
+
+此参数不会覆盖仍有 `settings.json` 的活动安装，也不会覆盖无法识别的非空目录；它也不会绕过模型目录冲突、认证或上游验证。
+
 ## 1.1.0 新增什么
 
 代理把 Copilot `/models` 的 `data` 数据转换为 Codex 所需的 `models` 目录。
@@ -170,7 +186,7 @@ python manage.py update --help
 
 ## 验证
 
-本次更新使用 `python -m unittest -v test_distribution` 验证 31 项测试，覆盖 ID 归一化、模型能力转换、安装/卸载、卸载残留目录重装与失败恢复、失效的本机连接恢复、连接诊断脱敏、默认路径提示、上下文恢复、hostname 保留与覆盖、服务重启、身份校验、停止超时、旧版原地更新、更新失败回退、更新前检查及中文和空格路径。认证使用合成测试凭据，模型目录检查使用测试替身。
+本次更新使用 `python -m unittest -v test_distribution` 验证 37 项测试，覆盖 ID 归一化、模型能力转换、安装/卸载、卸载残留目录重装与失败恢复、失效的本机连接恢复、强制重建配置及完整备份、连接诊断脱敏、默认路径提示、上下文恢复、hostname 保留与覆盖、服务重启、身份校验、停止超时、旧版原地更新、更新失败回退、更新前检查及中文和空格路径。认证使用合成测试凭据，模型目录检查使用测试替身。
 
 `npm test` 另验证 Node 命令入口的 Python 探测、参数转发、退出码和异常处理；npm 包可通过本地 `.tgz` 执行测试，无需发布到 registry。
 
@@ -203,12 +219,12 @@ npx --yes copilot-codex-companion@latest check
 npx --yes copilot-codex-companion@latest uninstall
 ```
 
-`@latest` 请求 registry 当前的 latest 版本；可换成 `@1.1.3` 固定版本。每次 `update` 都会执行原有的备份、校验和失败回退流程。安装后的服务使用 `%LOCALAPPDATA%\CodexCopilotCompat`（或 `--dest`），不依赖 npm 缓存路径；npx 退出后服务继续运行。等待活动任务结束并退出 Codex 后再更新，成功后重新打开 Codex 刷新凭据。
+`@latest` 请求 registry 当前的 latest 版本；可换成 `@1.1.4` 固定版本。每次 `update` 都会执行原有的备份、校验和失败回退流程。安装后的服务使用 `%LOCALAPPDATA%\CodexCopilotCompat`（或 `--dest`），不依赖 npm 缓存路径；npx 退出后服务继续运行。等待活动任务结束并退出 Codex 后再更新，成功后重新打开 Codex 刷新凭据。
 
 尚未发布时，可将 `npm pack` 生成的 `.tgz` 传到另一台电脑，直接通过 npx 使用：
 
 ```powershell
-npx --yes --package .\copilot-codex-companion-1.1.3.tgz copilot-codex-companion update --hostname git.example.com
+npx --yes --package .\copilot-codex-companion-1.1.4.tgz copilot-codex-companion update --hostname git.example.com
 ```
 
 维护者发布步骤：

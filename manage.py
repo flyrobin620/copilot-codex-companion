@@ -21,7 +21,7 @@ from pathlib import Path
 from catalog import ensure_defaults
 from auth_bridge import auth_args, restart_bridge, start_bridge, stop_bridge
 
-VERSION = '1.1.3'
+VERSION = '1.1.4'
 UPSTREAM = 'https://api.enterprise.githubcopilot.com'
 FILES = ('proxy.py', 'catalog.py', 'auth_bridge.py', 'manage.py', 'install.cmd', 'check.cmd', 'restart.cmd', 'update.cmd', 'uninstall.cmd', 'README.md')
 CONTEXT_KEYS = ('model_context_window','model_auto_compact_token_limit')
@@ -113,13 +113,13 @@ def preserve_uninstalled_files(dest, reinstall):
     if not reinstall:
         yield
         return
-    names = (*FILES, 'settings.json', 'catalog-defaults.json', 'config.before.toml')
+    names = (*FILES, 'settings.json', 'settings.failed.json', 'catalog-defaults.json', 'config.before.toml')
     previous = {name: (dest/name).read_bytes() if (dest/name).exists() else None for name in names}
     backup = Path(tempfile.mkdtemp(prefix='reinstall-backup-', dir=dest))
     for name, data in previous.items():
         if data is not None:
             (backup/name).write_bytes(data)
-    print(f'Uninstalled installation detected. Previous files backed up to: {backup}')
+    print(f'Previous installation files backed up to: {backup}')
     try:
         yield
     except Exception:
@@ -207,10 +207,39 @@ def recover_uninstalled_connection(original, cfg, state):
     return restored
 
 
-def install(config, dest, port, automatic_context=False, codex_command='codex', hostname=None, source=None):
+def force_copilot_connection(original, cfg, hostname):
+    """Explicitly rebuild this provider's connection using GitHub CLI auth."""
+    provider = cfg.get('model_provider', '')
+    if not re.fullmatch(r'[A-Za-z0-9_-]+', provider):
+        raise RuntimeError('--force-config requires a top-level custom model_provider.')
+    p = cfg.get('model_providers', {}).get(provider)
+    if not isinstance(p, dict):
+        raise RuntimeError('--force-config requires an existing custom provider table.')
+    expected = copy.deepcopy(cfg)
+    target = expected['model_providers'][provider]
+    restored = original
+    section = 'model_providers.' + provider
+    for key, value in {'base_url': UPSTREAM, 'wire_api': 'responses'}.items():
+        restored = field(restored, section, key, value)
+        target[key] = value
+    if 'auth' not in p:
+        restored = restored.rstrip() + '\n\n[' + section + '.auth]\n'
+    target.setdefault('auth', {})
+    for key, value in {'command': 'gh', 'args': auth_args(['auth', 'token'], hostname)}.items():
+        restored = field(restored, section+'.auth', key, value)
+        target['auth'][key] = value
+    if tomllib.loads(restored) != expected:
+        raise RuntimeError('Forced connection validation failed; current configuration was preserved.')
+    print('Forced connection repair selected: Copilot Enterprise Responses with gh auth token.')
+    return restored
+
+
+def install(config, dest, port, automatic_context=False, codex_command='codex', hostname=None, source=None, force_config=False):
     if os.name != 'nt':
         raise RuntimeError('This package supports Windows only.')
     if (dest/'settings.json').exists():
+        if force_config:
+            raise RuntimeError('An active installation exists. Uninstall it before using install --force-config; no configuration was changed.')
         s = settings_at(dest)
         if s['config'] != str(config):
             raise RuntimeError('This installation belongs to a different config. Choose another --dest and --port.')
@@ -219,15 +248,25 @@ def install(config, dest, port, automatic_context=False, codex_command='codex', 
     reinstall = None
     if dest.exists() and any(dest.iterdir()):
         reinstall = uninstalled_state(dest)
+        if reinstall is None and force_config and (dest/'settings.failed.json').is_file():
+            try:
+                failed = json.loads((dest/'settings.failed.json').read_text(encoding='utf-8'))
+                if not isinstance(failed, dict) or not failed.get('installation') or not isinstance(failed.get('config'), str):
+                    raise ValueError('Invalid failed-install state')
+                reinstall = failed
+            except (OSError, ValueError):
+                raise RuntimeError('Cannot read the previous failed-install state; existing files were preserved.') from None
         if reinstall is None:
             raise RuntimeError(f'Destination {dest} is not empty and has no valid uninstall state. Choose another --dest; existing files will not be overwritten.')
         if Path(reinstall['config']).resolve() != config.resolve():
             raise RuntimeError('Uninstalled files belong to a different config. Use its --config or choose another --dest.')
     if not config.is_file():
         raise RuntimeError('No Codex config found. Configure a working Copilot Enterprise connection first.')
-    original = config.read_text(encoding='utf-8-sig')
+    original_bytes = config.read_bytes()
+    original = original_bytes.decode('utf-8-sig').replace('\r\n', '\n').replace('\r', '\n')
     cfg = tomllib.loads(original)
-    connection_original = recover_uninstalled_connection(original, cfg, reinstall)
+    connection_original = (force_copilot_connection(original, cfg, hostname) if force_config
+                           else recover_uninstalled_connection(original, cfg, reinstall))
     cfg = tomllib.loads(connection_original)
     provider = cfg.get('model_provider', '')
     if not re.fullmatch(r'[A-Za-z0-9_-]+', provider):
@@ -240,7 +279,8 @@ def install(config, dest, port, automatic_context=False, codex_command='codex', 
         raise RuntimeError('This adapter requires wire_api = "responses". ' + details)
     if p.get('base_url', '').rstrip('/') != UPSTREAM:
         raise RuntimeError('The selected provider does not use the supported Copilot API URL. ' + details
-                           + f' Expected base_url: {UPSTREAM}. --hostname selects the credential host, not the API URL.')
+                           + f' Expected base_url: {UPSTREAM}. --hostname selects the credential host, not the API URL.'
+                           + ' If installation records were deleted, install --force-config explicitly rebuilds this provider using gh auth token.')
     if p.get('supports_websockets'):
         raise RuntimeError('This adapter supports HTTP/SSE only. WebSocket configuration was left unchanged.')
     a = p.get('auth', {})
@@ -284,11 +324,15 @@ def install(config, dest, port, automatic_context=False, codex_command='codex', 
         raise RuntimeError('Configuration validation failed; no configuration was changed.')
     source = source or Path(__file__).resolve().parent
     payload = {name: (source/name).read_bytes() for name in FILES}
+    if force_config:
+        with tempfile.NamedTemporaryFile('wb', prefix=config.name+'.before-force-', suffix='.bak', dir=config.parent, delete=False) as backup:
+            backup.write(original_bytes)
+            backup_path = Path(backup.name)
+        print(f'Original config backup: {backup_path}')
     with preserve_uninstalled_files(dest, reinstall):
         dest.mkdir(parents=True, exist_ok=True)
         for name, data in payload.items():
             write_atomic(dest/name, data)
-        ensure_defaults(dest,codex_command)
         state = {'version': VERSION, 'installation': secrets.token_hex(16), 'control': secrets.token_hex(32),
                  'config': str(config), 'runtime':str(dest), 'codex_command':codex_command,
                  'removed_context_overrides':removed_context, 'provider': provider, 'port': port, 'auth_command': command,
@@ -298,6 +342,7 @@ def install(config, dest, port, automatic_context=False, codex_command='codex', 
         (dest/'config.before.toml').write_text(connection_original, encoding='utf-8')
         (dest/'settings.json').write_text(json.dumps(state, indent=2), encoding='utf-8')
         try:
+            ensure_defaults(dest,codex_command)
             # Start and verify the installed runtime before changing the active connection.
             r = subprocess.run([sys.executable, str(dest/'auth_bridge.py')], capture_output=True,
                                timeout=changed['timeout_ms']/1000)
@@ -314,10 +359,13 @@ def install(config, dest, port, automatic_context=False, codex_command='codex', 
                 local_json(changed['base_url']+'/shutdown', b'', {'X-Compat-Control':state['control']})
             except Exception:
                 pass
-            (dest/'settings.json').rename(dest/'settings.failed.json')
+            (dest/'settings.json').replace(dest/'settings.failed.json')
             raise
         print(f'Installed {VERSION} in {dest}')
-        print('Existing provider, model, headers and login were preserved. No credential was printed.')
+        if force_config:
+            print('Provider, model and headers preserved; connection rebuilt using gh auth token. No credential was printed.')
+        else:
+            print('Existing provider, model, headers and login were preserved. No credential was printed.')
         if removed_context:
             print('Manual context/compaction overrides removed after catalog validation; uninstall can restore them.')
         print('Finish active tasks, fully exit and reopen Codex, then test in a new chat.')
@@ -360,8 +408,8 @@ def update(dest, hostname=None, source=None, config=None, port=None, automatic_c
 
 def _update(dest, hostname, source):
     state = settings_at(dest)
-    if state.get('version') not in ('1.1.0', '1.1.1', '1.1.2', VERSION):
-        raise RuntimeError('Only existing 1.1.0 through 1.1.3 installations are supported.')
+    if state.get('version') not in ('1.1.0', '1.1.1', '1.1.2', '1.1.3', VERSION):
+        raise RuntimeError('Only existing 1.1.0 through 1.1.4 installations are supported.')
     if Path(state['runtime']).resolve() != dest:
         raise RuntimeError('Installation path mismatch. Use the original installation directory.')
     cfg = tomllib.loads(Path(state['config']).read_text(encoding='utf-8-sig'))
@@ -510,16 +558,20 @@ def main():
     parser.add_argument('--config', type=Path)
     parser.add_argument('--live', action='store_true')
     parser.add_argument('--hostname', help='Persist the credential helper hostname when installing or updating.')
+    parser.add_argument('--force-config', '--force', action='store_true',
+                        help='Install only: explicitly rebuild the provider connection using Copilot Enterprise and gh auth token; back up config.toml before writing.')
     parser.add_argument('--automatic-context',action='store_true',help='Remove manual context/compaction overrides after validating the live model catalog.')
     parser.add_argument('--codex',help='Path to the matching Codex binary (default: codex; reinstall via update reuses the saved command).')
     options = parser.parse_args()
     if options.hostname is not None and options.action not in ('install', 'update'):
         parser.error('--hostname is only supported with install or update.')
+    if options.force_config and options.action != 'install':
+        parser.error('--force-config/--force is only supported with install.')
     dest = (options.dest or default_dest).resolve()
     config = (options.config or Path(os.environ.get('CODEX_HOME', str(Path.home()/'.codex')))/'config.toml').resolve()
     try:
         print(f'Installation directory: {dest}')
-        if options.action == 'install': install(config, dest, options.port if options.port is not None else 43129,options.automatic_context,options.codex or 'codex',options.hostname)
+        if options.action == 'install': install(config, dest, options.port if options.port is not None else 43129,options.automatic_context,options.codex or 'codex',options.hostname, force_config=options.force_config)
         elif options.action == 'update': update(dest, options.hostname, config=config if options.config else None,
                                                port=options.port, automatic_context=options.automatic_context, codex_command=options.codex)
         elif options.action == 'check': check(dest, options.live)

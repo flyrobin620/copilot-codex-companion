@@ -169,6 +169,84 @@ refresh_interval_ms = 300000
             try: manage.local_json(s['changed']['base_url']+'/shutdown',b'',{'X-Compat-Control':s['control']})
             except Exception: pass
 
+    def orphaned_config_fixture(self):
+        text = self.original.replace('some_existing_flag = true', 'some_existing_flag = false')
+        text = manage.field(text, 'model_providers.enterprise', 'base_url', f'http://127.0.0.1:{self.port}')
+        text = manage.field(text, 'model_providers.enterprise.auth', 'args', [str(self.dest/'auth_bridge.py')])
+        self.config.write_text(text, encoding='utf-8-sig')
+        return self.config.read_bytes()
+
+    def test_force_config_repairs_deleted_installation_and_backs_up_exact_bytes(self):
+        before = self.orphaned_config_fixture()
+        with mock.patch.object(manage.shutil, 'which', return_value='C:\\Synthetic gh.exe'), \
+             mock.patch.object(manage, 'credential', return_value=b'SYNTHETIC_TEST_CREDENTIAL') as credential, \
+             mock.patch.object(manage, 'ensure_defaults'), \
+             mock.patch.object(manage.subprocess, 'run', return_value=mock.Mock(returncode=0, stdout=b'SYNTHETIC_TEST_CREDENTIAL')), \
+             mock.patch.object(manage, 'local_json', side_effect=lambda *a, **k: {'installation': manage.settings_at(self.dest)['installation']}):
+            manage.install(self.config, self.dest, self.port, hostname='microsoft.ghe.com', force_config=True)
+            credential.assert_called_once_with('C:\\Synthetic gh.exe', ['auth', 'token', '--hostname', 'microsoft.ghe.com'], 5000)
+            state = manage.settings_at(self.dest)
+            self.assertEqual(state['old']['base_url'], manage.UPSTREAM)
+            self.assertEqual(state['old']['command'], 'gh')
+            self.assertEqual(state['old']['args'], ['auth', 'token', '--hostname', 'microsoft.ghe.com'])
+            backups = list(self.root.glob(self.config.name+'.before-force-*.bak'))
+            self.assertEqual(len(backups), 1)
+            self.assertEqual(backups[0].read_bytes(), before)
+            saved = tomllib.loads((self.dest/'config.before.toml').read_text(encoding='utf-8'))
+            self.assertEqual(saved['model_providers']['enterprise']['base_url'], manage.UPSTREAM)
+            self.assertFalse(saved['features']['some_existing_flag'])
+            self.assertEqual(saved['model_providers']['enterprise']['http_headers'], {'Editor-Version': 'existing-header'})
+            manage.uninstall(self.dest)
+        self.assertEqual(tomllib.loads(self.config.read_text(encoding='utf-8')), saved)
+
+    def test_orphaned_config_is_not_overwritten_without_force(self):
+        before = self.orphaned_config_fixture()
+        with self.assertRaisesRegex(RuntimeError, '--force-config'):
+            manage.install(self.config, self.dest, self.port, hostname='microsoft.ghe.com')
+        self.assertEqual(self.config.read_bytes(), before)
+        self.assertFalse(self.dest.exists())
+
+    def test_force_auth_failure_leaves_original_config_untouched(self):
+        before = self.orphaned_config_fixture()
+        with mock.patch.object(manage.shutil, 'which', return_value='C:\\Synthetic gh.exe'), \
+             mock.patch.object(manage, 'credential', side_effect=RuntimeError('Synthetic auth failure')):
+            with self.assertRaisesRegex(RuntimeError, 'auth failure'):
+                manage.install(self.config, self.dest, self.port, hostname='microsoft.ghe.com', force_config=True)
+        self.assertEqual(self.config.read_bytes(), before)
+        self.assertFalse(self.dest.exists())
+
+    def test_force_builds_missing_auth_table_without_default_hostname(self):
+        original = self.original.split('[model_providers.enterprise.auth]')[0]
+        restored = manage.force_copilot_connection(original, tomllib.loads(original), None)
+        p = tomllib.loads(restored)['model_providers']['enterprise']
+        self.assertEqual(p['auth'], {'command': 'gh', 'args': ['auth', 'token']})
+        self.assertEqual(p['base_url'], manage.UPSTREAM)
+
+    def test_force_alias_is_forwarded_and_rejected_for_other_actions(self):
+        for flag in ('--force-config', '--force'):
+            with mock.patch.object(sys, 'argv', ['manage.py', 'install', flag, '--hostname', 'microsoft.ghe.com']), \
+                 mock.patch.object(manage, 'install') as install, mock.patch.object(sys, 'stdout', io.StringIO()):
+                self.assertEqual(manage.main(), 0)
+                self.assertTrue(install.call_args.kwargs['force_config'])
+                self.assertEqual(install.call_args.args[5], 'microsoft.ghe.com')
+        with mock.patch.object(sys, 'argv', ['manage.py', 'update', '--force']), mock.patch.object(sys, 'stderr', io.StringIO()):
+            with self.assertRaises(SystemExit) as exc:
+                manage.main()
+            self.assertEqual(exc.exception.code, 2)
+
+    def test_force_can_retry_after_catalog_failure_without_deleting_folder(self):
+        before = self.orphaned_config_fixture()
+        with mock.patch.object(manage.shutil, 'which', return_value='C:\\Synthetic gh.exe'), \
+             mock.patch.object(manage, 'credential', return_value=b'SYNTHETIC_TEST_CREDENTIAL'), \
+             mock.patch.object(manage, 'ensure_defaults', side_effect=RuntimeError('Synthetic catalog failure')), \
+             mock.patch.object(manage, 'local_json', return_value={}):
+            for attempt in range(2):
+                with self.assertRaisesRegex(RuntimeError, 'catalog failure'):
+                    manage.install(self.config, self.dest, self.port, hostname='microsoft.ghe.com', force_config=True)
+                self.assertFalse((self.dest/'settings.json').exists())
+                self.assertTrue((self.dest/'settings.failed.json').is_file())
+                self.assertEqual(self.config.read_bytes(), before)
+
     def uninstalled_fixture(self):
         self.dest.mkdir()
         # Match the user's legacy 1.0 directory: no settings.json or catalog.py.

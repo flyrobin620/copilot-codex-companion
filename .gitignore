@@ -13,3 +13,4 @@ catalog-defaults.json
 update-backup-*/
 reinstall-backup-*/
 update.lock
+*.before-force-*.bak

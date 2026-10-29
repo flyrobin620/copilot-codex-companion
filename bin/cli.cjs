@@ -19,6 +19,7 @@ Commands:
 Options:
   --dest PATH          Existing/custom installation directory
   --hostname HOST      Persist the authentication host (install/update)
+  --force-config       Rebuild the connection using gh auth token (install)
   --config PATH        Codex config.toml (install)
   --port PORT          Local port (install)
   --codex PATH         Matching Codex executable (install)

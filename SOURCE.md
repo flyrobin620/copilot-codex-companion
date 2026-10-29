@@ -12,6 +12,8 @@ Version 1.1.2 supports reinstalling into recognized uninstalled directories whil
 
 Version 1.1.3 recovers stale local bridge connection fields from matching uninstall records before reinstalling, and adds redacted connection diagnostics.
 
+Version 1.1.4 adds explicit install --force-config / --force recovery using GitHub CLI authentication, with an exact backup of the prior configuration and support for retrying recognized failed installations.
+
 The existing test_distribution.py was copied from the development directory and extended for hostname and restart behavior. Its installation tests write disposable fixtures to the sibling distribution-tests directory. Run `python -m unittest -v test_distribution` to verify the updated sources.
 
 This supersedes the earlier 1.0.0 import. Python 3.11 or newer is required; see README.md for usage.
